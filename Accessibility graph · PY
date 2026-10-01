@@ -1,0 +1,171 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import os
+from typing import TypedDict
+
+import requests
+import textstat
+from bs4 import BeautifulSoup
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
+from pypdf import PdfReader
+
+MAX_CHARS = 6000
+MAX_AUTO_RETRIES = 2
+
+# ---------------- model (Gemma via Google API) ----------------
+if os.getenv("LLM_PROVIDER", "google") == "google":
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    llm = ChatGoogleGenerativeAI(
+        model=os.getenv("MODEL_NAME", "gemma-3-27b-it"),
+        temperature=0.2,
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+    )
+else:
+    from langchain_ollama import ChatOllama
+
+    llm = ChatOllama(model=os.getenv("MODEL_NAME", "gemma3:4b"), temperature=0.2)
+
+parse = StrOutputParser()
+
+
+def ask(template: str, **kw) -> str:
+    return (ChatPromptTemplate.from_template(template) | llm | parse).invoke(kw).strip()
+
+
+RULES = {
+    "dyslexia": "Short sentences (max 15 words), simple words, bullet points, key takeaways first.",
+    "non_native": "Plain English at B1 level. No idioms. Short, direct sentences.",
+    "beginner": "Explain for someone with no background. Define technical terms in brackets.",
+}
+
+
+class State(TypedDict, total=False):
+    source: str
+    profile: str
+    simplified: str
+    verdict: str
+    feedback: str
+    retries: int
+    approved: bool
+    glossary: str
+    grade_before: float
+    grade_after: float
+
+
+def load_content(src: str) -> str:
+    s = src.strip()
+    low = s.lower()
+    if low.startswith("http"):
+        soup = BeautifulSoup(requests.get(s, timeout=15).text, "html.parser")
+        for t in soup(["script", "style", "nav", "footer"]):
+            t.decompose()
+        return soup.get_text(separator="\n", strip=True)
+    if low.endswith(".pdf"):
+        return "\n".join(p.extract_text() or "" for p in PdfReader(s).pages)
+    if low.endswith(".txt"):
+        with open(s, encoding="utf-8") as f:
+            return f.read()
+    return s
+
+
+def ingest(state: State) -> State:
+    text = load_content(state["source"])[:MAX_CHARS]
+    return {
+        "source": text,
+        "retries": 0,
+        "feedback": "",
+        "grade_before": round(textstat.flesch_kincaid_grade(text), 1),
+    }
+
+
+def simplify(state: State) -> State:
+    fb = state.get("feedback", "")
+    fb_block = f"\nFix these problems from the last attempt: {fb}\n" if fb else ""
+    out = ask(
+        "Rewrite this text for a reader who needs: {rules}\n"
+        "Never change facts, numbers, names, dates or warnings.{fb}\n"
+        "TEXT:\n{text}\n\nRewritten text only:",
+        rules=RULES[state["profile"]],
+        fb=fb_block,
+        text=state["source"],
+    )
+    return {"simplified": out}
+
+
+def verify(state: State) -> State:
+    res = ask(
+        "You are a strict fact-checker. Is any fact, number, date, name or warning "
+        "in SIMPLIFIED wrong or changed compared to ORIGINAL?\n"
+        "Reply exactly 'PASS' or 'FAIL: <short list of problems>'.\n\n"
+        "ORIGINAL:\n{o}\n\nSIMPLIFIED:\n{s}",
+        o=state["source"],
+        s=state["simplified"],
+    )
+    if res.upper().startswith("PASS"):
+        return {"verdict": "PASS", "feedback": ""}
+    return {
+        "verdict": "FAIL",
+        "feedback": res.split(":", 1)[-1].strip(),
+        "retries": state.get("retries", 0) + 1,
+    }
+
+
+def route_after_verify(state: State) -> str:
+    if state["verdict"] == "FAIL" and state["retries"] <= MAX_AUTO_RETRIES:
+        return "simplify"
+    return "human_review"
+
+
+def human_review(state: State) -> State:
+    answer = interrupt(
+        {
+            "simplified": state["simplified"],
+            "verdict": state["verdict"],
+            "verifier_notes": state.get("feedback", ""),
+            "ask": "Type 'approve' to accept, or type what to change.",
+        }
+    )
+    if str(answer).strip().lower() in {"approve", "ok", "yes", "y", ""}:
+        return {"approved": True}
+    return {"approved": False, "feedback": str(answer), "retries": 0}
+
+
+def route_after_review(state: State) -> str:
+    return "glossary" if state["approved"] else "simplify"
+
+
+def glossary(state: State) -> State:
+    g = ask(
+        "List the difficult terms in this text, max 8. One per line as: "
+        "term :: simple meaning. Write NONE if there are none.\n\n{t}",
+        t=state["source"],
+    )
+    return {
+        "glossary": g,
+        "grade_after": round(textstat.flesch_kincaid_grade(state["simplified"]), 1),
+    }
+
+
+def build_app():
+    g = StateGraph(State)
+    g.add_node("ingest", ingest)
+    g.add_node("simplify", simplify)
+    g.add_node("verify", verify)
+    g.add_node("human_review", human_review)
+    g.add_node("glossary", glossary)
+
+    g.add_edge(START, "ingest")
+    g.add_edge("ingest", "simplify")
+    g.add_edge("simplify", "verify")
+    g.add_conditional_edges("verify", route_after_verify, ["simplify", "human_review"])
+    g.add_conditional_edges("human_review", route_after_review, ["glossary", "simplify"])
+    g.add_edge("glossary", END)
+
+    return g.compile(checkpointer=MemorySaver())
